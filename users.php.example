@@ -1,0 +1,21 @@
+<?php
+// 如果用户定义了tunnel，这个用户的流量总是转发给这个tunnel。如果没有定义，将从tunnels池中随机选择。
+// 用户名不区分大小写，并且不应该重复，如果重复，以最后定义的为准。
+return [
+    'tunnels' => [
+        'tcp://127.0.0.1:4040',
+        'tcp://127.0.0.1:4041',
+    ],
+    'users' => [
+        [
+            'username' => 'test',
+            'password' => 'test',
+            'tunnel' => '',
+        ],
+        [
+            'username' => 'test1',
+            'password' => 'test1',
+            'tunnel' => 'tcp://127.0.0.1:4041',
+        ],
+    ],
+];

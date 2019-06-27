@@ -1,0 +1,275 @@
+#!/usr/bin/env php
+<?php
+
+require_once __DIR__ . '/../vendor/autoload.php';
+
+\Dotenv\Dotenv::create(__DIR__ . '/../')->load();
+
+class Forward
+{
+    public static $config = [];
+
+    public static function onWorkerStart($worker)
+    {
+        $worker->config = self::$config;
+    }
+
+    public static function onWorkerStop($connection)
+    {
+    }
+
+    public static function onConnect($connection)
+    {
+    }
+
+    public static function onMessage($connection, $data)
+    {
+        $worker = $connection->worker;
+        $config = $worker->config;
+        list($authorization, $method, $uri, $httpVersion, $host) = self::parseHeader($data);
+        if (empty($host)) {
+            $connection->close();
+            return;
+        }
+        if (empty($authorization)) {
+            self::foreAuth($connection, !empty($config['name']) ? $config['name'] : 'X');
+            return;
+        }
+        list($user, $pwd) = self::parseAuth($authorization);
+        if (empty($user)) {
+            $connection->close();
+            return;
+        }
+        $fetchUser = self::fetchUser($user);
+        if (empty($fetchUser['username'])) {
+            self::foreAuth($connection, !empty($config['name']) ? $config['name'] : 'X');
+            return;
+        }
+        if ($fetchUser['password'] !== $pwd) {
+            self::foreAuth($connection, !empty($config['name']) ? $config['name'] : 'X');
+            return;
+        }
+        $pool = count($config['tunnels']);
+        if (!empty($fetchUser['tunnel'])) {
+            $tunnel = $fetchUser['tunnel'];
+        } elseif ($pool > 0) {
+            if ($pool === 1) {
+                $p = 0;
+            } else {
+                $p = mt_rand(0, $pool - 1);
+            }
+            $tunnel = $config['tunnels'][$p];
+        }
+        //
+        if (!isset($worker->request)) {
+            $worker->request = 0;
+        }
+        $worker->request += 1;
+        if ($worker->request > $config['max_request']) {
+            $connection->close();
+            \Workerman\Worker::stopAll();
+            return;
+        }
+        // CN DOMAIN
+        if (!empty($config['forward']) && (strtolower(substr($host, -3)) === '.cn')) {
+            self::forwardTo($config['forward'], $connection, $data);
+            return;
+        }
+        if (empty($tunnel)) {
+            $connection->close();
+            return;
+        }
+        self::forwardTo($tunnel, $connection, $data);
+    }
+
+    public static function onClose($connection)
+    {
+    }
+
+    public static function configSocket($socket, $transport = '')
+    {
+        if (!empty(self::$config['socket'])) {
+            if (function_exists('socket_import_stream') && $transport === 'tcp') {
+                set_error_handler(function () {
+                });
+                $socket = socket_import_stream($socket);
+                foreach (self::$config['socket'] as $optname => $optval) {
+                    if (defined($optname)) {
+                        socket_set_option($socket, SOL_TCP, constant($optname), $optval);
+                        socket_set_option($socket, SOL_SOCKET, constant($optname), $optval);
+                    }
+                }
+                restore_error_handler();
+            }
+        }
+    }
+
+    protected static function parseHeader($data)
+    {
+        $authorization = $method = $uri = $httpVersion = $host = '';
+        $i = 0;
+        $headers = explode("\n", $data);
+        foreach ($headers as $header) {
+            if (empty($header)) {
+                continue;
+            }
+            if ($i === 0) {
+                list($method, $uri, $httpVersion) = explode(' ', $header);
+                if (!empty($uri)) {
+                    $u = parse_url($uri);
+                    if (!empty($u['host'])) {
+                        $host = trim($u['host']);
+                    }
+                }
+            }
+            $cut = explode(": ", $header);
+            if (isset($cut[0]) && isset($cut[1])) {
+                if ($cut[0] === 'Proxy-Authorization') {
+                    $authorization = trim($cut[1]);
+                }
+            }
+            $i++;
+        }
+        return [$authorization, $method, $uri, $httpVersion, $host];
+    }
+
+    protected static function parseAuth($authorization)
+    {
+        $user = $pwd = '';
+        $authorization = explode(" ", $authorization);
+        if (!empty($authorization[0]) && !empty($authorization[1])) {
+            $authorization[0] = trim($authorization[0]);
+            $authorization[1] = trim($authorization[1]);
+            $map = explode(":", base64_decode(trim($authorization[1])));
+            if ($authorization[0] === 'Basic' && !empty($map[0]) && !empty($map[1])) {
+                $user = strtolower(trim($map[0]));
+                $pwd = trim($map[1]);
+            }
+        }
+        return [$user, $pwd];
+    }
+
+    protected static function fetchUser($username)
+    {
+        if (!empty(self::$config['users']) && isset(self::$config['users'][$username])) {
+            return self::$config['users'][$username];
+        }
+        return false;
+    }
+
+    protected static function foreAuth($connection, $name = 'X')
+    {
+        $response = "HTTP/1.1 407 Proxy Authentication Required\nProxy-Authenticate: Basic realm=\"" . $name . "\"\r\n\r\n";
+        $connection->send($response);
+        $connection->close();
+    }
+
+    protected static function forwardTo($tunnel, $connection, $data)
+    {
+        $remote = new \Workerman\Connection\AsyncTcpConnection($tunnel);
+        self::configSocket($remote->getSocket(), 'tcp');
+        $remote->onConnect = function ($remote) use ($connection, $data) {
+            $remote->send($data);
+            $remote->pipe($connection);
+            $connection->pipe($remote);
+        };
+        $remote->connect();
+    }
+}
+
+class App
+{
+    protected $config = [];
+
+    public static function instance($configFile, $userFile)
+    {
+        $config = [];
+        if (file_exists($configFile)) {
+            $config = include $configFile;
+        }
+        $tunnels = [];
+        $users = [];
+        if (file_exists($userFile)) {
+            $hold = include $userFile;
+            if (!empty($hold['tunnels']) && is_array($hold['tunnels'])) {
+                $tunnels = $hold['tunnels'];
+                foreach ($tunnels as $idx => $t) {
+                    if (empty($t)) {
+                        unset($tunnels[$idx]);
+                    }
+                }
+            }
+            if (!empty($hold['users']) && is_array($hold['users'])) {
+                foreach ($hold['users'] as $user) {
+                    if (!is_array($user) || empty($user['username']) || empty($user['password'])) {
+                        continue;
+                    }
+                    $un = strtolower(trim($user['username']));
+                    $users[$un] = [
+                        'username' => $un,
+                        'password' => trim($user['password']),
+                        'tunnel' => !empty($user['tunnel']) ? trim($user['tunnel']) : ''
+                    ];
+                }
+            }
+        }
+        $config['tunnels'] = $tunnels;
+        $config['users'] = $users;
+        return new static($config);
+    }
+
+    public function __construct($config)
+    {
+        $this->config = $config;
+        if (!empty($this->config['daemonize'])) {
+            \Workerman\Worker::$daemonize = true;
+        }
+        if (!empty($this->config['pid_file'])) {
+            \Workerman\Worker::$pidFile = $this->config['pid_file'];
+        }
+        if (!empty($this->config['stdout'])) {
+            \Workerman\Worker::$stdoutFile = $this->config['stdout'];
+        }
+        if (!empty($this->config['log_file'])) {
+            \Workerman\Worker::$logFile = $this->config['log_file'];
+        }
+        if (!empty($this->config['max_package_size'])) {
+            \Workerman\Connection\TcpConnection::$defaultMaxPackageSize = $this->config['max_package_size'];
+        }
+        if (!empty($this->config['max_send_buffer_size'])) {
+            \Workerman\Connection\TcpConnection::$defaultMaxSendBufferSize = $this->config['max_send_buffer_size'];
+        }
+    }
+
+    public function run()
+    {
+        $options = [];
+        if (!empty($this->config['context_option']) && is_array($this->config['context_option'])) {
+            $options = $this->config['context_option'];
+        }
+        $worker = new \Workerman\Worker($this->config['listen'], $options);
+        if (!empty($this->config['worker_user'])) {
+            $worker->user = $this->config['worker_user'];
+        }
+        if (!empty($this->config['worker_group'])) {
+            $worker->group = $this->config['worker_group'];
+        }
+        if (!empty($this->config['name'])) {
+            $worker->name = $this->config['name'];
+        }
+        $worker->count = (isset($this->config['worker_count']) && ((int)$this->config['worker_count'] > 0)) ? (int)$this->config['worker_count'] : 1;
+        Forward::$config = $this->config;
+        Forward::configSocket($worker->getMainSocket(), $worker->transport);
+        $worker->onWorkerStart = ['Forward', 'onWorkerStart'];
+        $worker->onWorkerStop = ['Forward', 'onWorkerStop'];
+        //$worker->onConnect = ['Forward', 'onConnect'];
+        $worker->onMessage = ['Forward', 'onMessage'];
+        //$worker->onClose = ['Forward', 'onClose'];
+        \Workerman\Worker::runAll();
+    }
+}
+
+// RUN
+$configFile = __DIR__ . '/../config.php';
+$userFile = __DIR__ . '/../users.php';
+App::instance($configFile, $userFile)->run();
